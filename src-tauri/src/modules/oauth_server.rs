@@ -121,7 +121,7 @@ async fn ensure_oauth_flow_prepared(app_handle: Option<tauri::AppHandle>) -> Res
     };
 
     let state_str = uuid::Uuid::new_v4().to_string();
-    let auth_url = oauth::get_auth_url(&redirect_uri, &state_str);
+    let auth_url = oauth::get_auth_url(&redirect_uri, &state_str)?;
 
     // Cancellation signal (supports multiple consumers)
     let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -458,7 +458,7 @@ pub async fn submit_oauth_code(code_input: String, state_input: Option<String>) 
 /// Manually prepare an OAuth flow without starting listeners.
 /// Useful for Web/Docker environments where we only need manual code submission.
 pub fn prepare_oauth_flow_manually(redirect_uri: String, state_str: String) -> Result<(String, mpsc::Receiver<Result<String, String>>), String> {
-    let auth_url = oauth::get_auth_url(&redirect_uri, &state_str);
+    let auth_url = oauth::get_auth_url(&redirect_uri, &state_str)?;
     
     // Check if we can reuse existing state
     if let Ok(mut lock) = get_oauth_flow_state().lock() {

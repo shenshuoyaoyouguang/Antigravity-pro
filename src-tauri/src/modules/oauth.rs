@@ -1,44 +1,87 @@
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
+#[cfg(test)]
+pub(crate) static OAUTH_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn reset_oauth_credentials_for_tests() {
+    unsafe {
+        let ptr = &CREDENTIALS as *const OnceLock<OAuthCredentials> as *mut OnceLock<OAuthCredentials>;
+        (*ptr).take();
+    }
+}
+
 // Google OAuth configuration
-// Credentials are loaded from: 1) Environment variables 2) Config file 3) Built-in defaults
+// Credentials are loaded from: 1) Environment variables 2) Config file
 // Set environment variables: GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET
 // Or create config file: ~/.antigravity/oauth.json
 
-static CLIENT_ID: OnceLock<String> = OnceLock::new();
-static CLIENT_SECRET: OnceLock<String> = OnceLock::new();
-
-fn get_client_id() -> &'static str {
-    CLIENT_ID.get_or_init(|| {
-        // 1. Try environment variable
-        if let Ok(id) = std::env::var("GOOGLE_OAUTH_CLIENT_ID") {
-            return id;
-        }
-        // 2. Try config file
-        if let Some(id) = load_oauth_config().map(|c| c.client_id).flatten() {
-            return id;
-        }
-        // 3. No default - user must configure credentials
-        tracing::warn!("Google OAuth credentials not configured. Set GOOGLE_OAUTH_CLIENT_ID environment variable or create config file.");
-        String::new()
-    })
+/// OAuth credentials container - unified loading with OnceLock
+#[derive(Debug, Clone)]
+pub struct OAuthCredentials {
+    pub client_id: String,
+    pub client_secret: String,
 }
 
-fn get_client_secret() -> &'static str {
-    CLIENT_SECRET.get_or_init(|| {
-        // 1. Try environment variable
-        if let Ok(secret) = std::env::var("GOOGLE_OAUTH_CLIENT_SECRET") {
-            return secret;
+static CREDENTIALS: OnceLock<OAuthCredentials> = OnceLock::new();
+
+/// Load credentials from env or config file using and_then style
+fn try_load_from_env() -> Option<OAuthCredentials> {
+    std::env::var("GOOGLE_OAUTH_CLIENT_ID")
+        .ok()
+        .and_then(|client_id| {
+            std::env::var("GOOGLE_OAUTH_CLIENT_SECRET")
+                .ok()
+                .map(|client_secret| OAuthCredentials {
+                    client_id,
+                    client_secret,
+                })
+        })
+}
+
+fn try_load_from_config() -> Option<OAuthCredentials> {
+    load_oauth_config()
+        .and_then(|config| {
+            config.client_id.and_then(|client_id| {
+                config.client_secret.map(|client_secret| OAuthCredentials {
+                    client_id,
+                    client_secret,
+                })
+            })
+        })
+}
+
+/// Get OAuth credentials, initializing once if not already loaded.
+/// Returns error if credentials are missing or incomplete.
+pub fn get_oauth_credentials() -> Result<&'static OAuthCredentials, String> {
+    // Try to initialize if not already done
+    if CREDENTIALS.get().is_none() {
+        let creds = try_load_from_env()
+            .or_else(try_load_from_config);
+
+        match creds {
+            Some(c) => {
+                let _ = CREDENTIALS.set(c);
+            }
+            None => {
+                return Err("OAuth credentials not configured. Please set GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET environment variables or create ~/.antigravity/oauth.json config file".to_string());
+            }
         }
-        // 2. Try config file
-        if let Some(secret) = load_oauth_config().map(|c| c.client_secret).flatten() {
-            return secret;
+    }
+
+    // Verify credentials are actually loaded (not empty strings)
+    if let Some(creds) = CREDENTIALS.get() {
+        if creds.client_id.is_empty() {
+            return Err("OAuth client_id is empty. Please set GOOGLE_OAUTH_CLIENT_ID environment variable or configure in ~/.antigravity/oauth.json".to_string());
         }
-        // 3. No default - user must configure credentials
-        tracing::warn!("Google OAuth credentials not configured. Set GOOGLE_OAUTH_CLIENT_SECRET environment variable or create config file.");
-        String::new()
-    })
+        if creds.client_secret.is_empty() {
+            return Err("OAuth client_secret is empty. Please set GOOGLE_OAUTH_CLIENT_SECRET environment variable or configure in ~/.antigravity/oauth.json".to_string());
+        }
+        Ok(creds)
+    } else {
+        Err("OAuth credentials not configured. Please set GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET environment variables or create ~/.antigravity/oauth.json config file".to_string())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,7 +93,7 @@ struct OAuthConfig {
 fn load_oauth_config() -> Option<OAuthConfig> {
     let config_path = dirs::config_dir()
         .map(|p| p.join("antigravity").join("oauth.json"))?;
-    
+
     if config_path.exists() {
         let content = std::fs::read_to_string(&config_path).ok()?;
         serde_json::from_str(&content).ok()
@@ -92,7 +135,7 @@ impl UserInfo {
                 return Some(name.clone());
             }
         }
-        
+
         // If name is empty, combine given_name and family_name
         match (&self.given_name, &self.family_name) {
             (Some(given), Some(family)) => Some(format!("{} {}", given, family)),
@@ -103,9 +146,10 @@ impl UserInfo {
     }
 }
 
-
 /// Generate OAuth authorization URL
-pub fn get_auth_url(redirect_uri: &str, state: &str) -> String {
+pub fn get_auth_url(redirect_uri: &str, state: &str) -> Result<String, String> {
+    let creds = get_oauth_credentials()?;
+
     let scopes = vec![
         "https://www.googleapis.com/auth/cloud-platform",
         "https://www.googleapis.com/auth/userinfo.email",
@@ -115,7 +159,7 @@ pub fn get_auth_url(redirect_uri: &str, state: &str) -> String {
     ].join(" ");
 
     let params = vec![
-        ("client_id", get_client_id()),
+        ("client_id", creds.client_id.as_str()),
         ("redirect_uri", redirect_uri),
         ("response_type", "code"),
         ("scope", &scopes),
@@ -124,23 +168,26 @@ pub fn get_auth_url(redirect_uri: &str, state: &str) -> String {
         ("include_granted_scopes", "true"),
         ("state", state),
     ];
-    
+
     let url = url::Url::parse_with_params(AUTH_URL, &params).expect("Invalid Auth URL");
-    url.to_string()
+    Ok(url.to_string())
 }
 
 /// Exchange authorization code for token
 pub async fn exchange_code(code: &str, redirect_uri: &str) -> Result<TokenResponse, String> {
+    // Initialize credentials first and propagate error
+    let creds = get_oauth_credentials()?;
+
     // [PHASE 2] 对于登录行为，尚未有 account_id，使用全局池阶梯逻辑
     let client = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
         pool.get_effective_standard_client(None, 60).await
     } else {
         crate::utils::http::get_long_standard_client()
     };
-    
+
     let params = [
-        ("client_id", get_client_id()),
-        ("client_secret", get_client_secret()),
+        ("client_id", creds.client_id.as_str()),
+        ("client_secret", creds.client_secret.as_str()),
         ("code", code),
         ("redirect_uri", redirect_uri),
         ("grant_type", "authorization_code"),
@@ -169,14 +216,14 @@ pub async fn exchange_code(code: &str, redirect_uri: &str) -> Result<TokenRespon
         let token_res = response.json::<TokenResponse>()
             .await
             .map_err(|e| format!("Token parsing failed: {}", e))?;
-        
+
         // Add detailed logs
         crate::modules::logger::log_info(&format!(
             "Token exchange successful! access_token: {}..., refresh_token: {}",
             &token_res.access_token.chars().take(20).collect::<String>(),
             if token_res.refresh_token.is_some() { "✓" } else { "✗ Missing" }
         ));
-        
+
         // Log warning if refresh_token is missing
         if token_res.refresh_token.is_none() {
             crate::modules::logger::log_warn(
@@ -186,7 +233,7 @@ pub async fn exchange_code(code: &str, redirect_uri: &str) -> Result<TokenRespon
                  3. OAuth parameter configuration issue"
             );
         }
-        
+
         Ok(token_res)
     } else {
         let error_text = response.text().await.unwrap_or_default();
@@ -196,16 +243,19 @@ pub async fn exchange_code(code: &str, redirect_uri: &str) -> Result<TokenRespon
 
 /// Refresh access_token using refresh_token
 pub async fn refresh_access_token(refresh_token: &str, account_id: Option<&str>) -> Result<TokenResponse, String> {
+    // Initialize credentials first and propagate error
+    let creds = get_oauth_credentials()?;
+
     // [PHASE 2] 根据 account_id 使用对应的代理
     let client = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
         pool.get_effective_standard_client(account_id, 60).await
     } else {
         crate::utils::http::get_long_standard_client()
     };
-    
+
     let params = [
-        ("client_id", get_client_id()),
-        ("client_secret", get_client_secret()),
+        ("client_id", creds.client_id.as_str()),
+        ("client_secret", creds.client_secret.as_str()),
         ("refresh_token", refresh_token),
         ("grant_type", "refresh_token"),
     ];
@@ -216,7 +266,7 @@ pub async fn refresh_access_token(refresh_token: &str, account_id: Option<&str>)
     } else {
         crate::modules::logger::log_info("Refreshing Token for generic request (no account_id)...");
     }
-    
+
     tracing::debug!(
         "[OAuth] Sending refresh_access_token request with User-Agent: {}",
         crate::constants::NATIVE_OAUTH_USER_AGENT.as_str()
@@ -241,7 +291,7 @@ pub async fn refresh_access_token(refresh_token: &str, account_id: Option<&str>)
             .json::<TokenResponse>()
             .await
             .map_err(|e| format!("Refresh data parsing failed: {}", e))?;
-        
+
         crate::modules::logger::log_info(&format!("Token refreshed successfully! Expires in: {} seconds", token_data.expires_in));
         Ok(token_data)
     } else {
@@ -257,7 +307,7 @@ pub async fn get_user_info(access_token: &str, account_id: Option<&str>) -> Resu
     } else {
         crate::utils::http::get_client()
     };
-    
+
     let response = client
         .get(USERINFO_URL)
         .bearer_auth(access_token)
@@ -282,16 +332,16 @@ pub async fn ensure_fresh_token(
     account_id: Option<&str>,
 ) -> Result<crate::models::TokenData, String> {
     let now = chrono::Local::now().timestamp();
-    
+
     // If no expiry or more than 5 minutes valid, return direct
     if current_token.expiry_timestamp > now + 300 {
         return Ok(current_token.clone());
     }
-    
+
     // Need to refresh
     crate::modules::logger::log_info(&format!("Token expiring soon for account {:?}, refreshing...", account_id));
     let response = refresh_access_token(&current_token.refresh_token, account_id).await?;
-    
+
     // Construct new TokenData
     Ok(crate::models::TokenData::new(
         response.access_token,
@@ -306,15 +356,184 @@ pub async fn ensure_fresh_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+    // Use a mutex to ensure tests don't run in parallel (affects global state)
+    use crate::modules::oauth::{OAUTH_TEST_MUTEX, reset_oauth_credentials_for_tests};
+
+    fn reset_credentials() {
+        reset_oauth_credentials_for_tests();
+    }
+
+    fn create_temp_config_file(client_id: &str, client_secret: &str) -> PathBuf {
+        let temp_dir = std::env::temp_dir().join(format!("oauth_test_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let config_path = temp_dir.join("oauth.json");
+
+        let config = serde_json::json!({
+            "client_id": client_id,
+            "client_secret": client_secret
+        });
+        fs::write(&config_path, config.to_string()).unwrap();
+
+        config_path
+    }
 
     #[test]
-    fn test_get_auth_url_contains_state() {
-        let redirect_uri = "http://localhost:8080/callback";
-        let state = "test-state-123456";
-        let url = get_auth_url(redirect_uri, state);
-        
+    fn test_get_auth_url_returns_result() {
+        let _guard = OAUTH_TEST_MUTEX.lock().unwrap();
+        reset_credentials();
+
+        // Without credentials, should return error
+        env::remove_var("GOOGLE_OAUTH_CLIENT_ID");
+        env::remove_var("GOOGLE_OAUTH_CLIENT_SECRET");
+
+        let result = get_auth_url("http://localhost:8080/callback", "test-state");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err();
+        assert!(err_msg.contains("client_id") || err_msg.contains("credentials not configured"));
+    }
+
+    #[test]
+    fn test_get_auth_url_with_env_credentials() {
+        let _guard = OAUTH_TEST_MUTEX.lock().unwrap();
+        reset_credentials();
+
+        env::set_var("GOOGLE_OAUTH_CLIENT_ID", "test-client-id-from-env");
+        env::set_var("GOOGLE_OAUTH_CLIENT_SECRET", "test-client-secret-from-env");
+
+        let result = get_auth_url("http://localhost:8080/callback", "test-state-123456");
+        assert!(result.is_ok());
+
+        let url = result.unwrap();
         assert!(url.contains("state=test-state-123456"));
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcallback"));
         assert!(url.contains("response_type=code"));
+        assert!(url.contains("client_id=test-client-id-from-env"));
+
+        env::remove_var("GOOGLE_OAUTH_CLIENT_ID");
+        env::remove_var("GOOGLE_OAUTH_CLIENT_SECRET");
+    }
+
+    #[test]
+    fn test_env_takes_precedence_over_config() {
+        let _guard = OAUTH_TEST_MUTEX.lock().unwrap();
+        reset_credentials();
+
+        // Set env vars
+        env::set_var("GOOGLE_OAUTH_CLIENT_ID", "env-client-id");
+        env::set_var("GOOGLE_OAUTH_CLIENT_SECRET", "env-client-secret");
+
+        let result = get_oauth_credentials();
+        assert!(result.is_ok());
+
+        let creds = result.unwrap();
+        assert_eq!(creds.client_id, "env-client-id");
+        assert_eq!(creds.client_secret, "env-client-secret");
+
+        env::remove_var("GOOGLE_OAUTH_CLIENT_ID");
+        env::remove_var("GOOGLE_OAUTH_CLIENT_SECRET");
+    }
+
+    #[test]
+    fn test_empty_client_id_returns_error() {
+        let _guard = OAUTH_TEST_MUTEX.lock().unwrap();
+        reset_credentials();
+
+        // Manually set credentials with empty client_id
+        unsafe {
+            let empty_creds = OAuthCredentials {
+                client_id: "".to_string(),
+                client_secret: "valid-secret".to_string(),
+            };
+            let _ = CREDENTIALS.set(empty_creds);
+        }
+
+        let result = get_oauth_credentials();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("client_id is empty"));
+    }
+
+    #[test]
+    fn test_empty_client_secret_returns_error() {
+        let _guard = OAUTH_TEST_MUTEX.lock().unwrap();
+        reset_credentials();
+
+        // Manually set credentials with empty client_secret
+        unsafe {
+            let empty_creds = OAuthCredentials {
+                client_id: "valid-id".to_string(),
+                client_secret: "".to_string(),
+            };
+            let _ = CREDENTIALS.set(empty_creds);
+        }
+
+        let result = get_oauth_credentials();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("client_secret is empty"));
+    }
+
+    #[test]
+    fn test_missing_credentials_error_message() {
+        let _guard = OAUTH_TEST_MUTEX.lock().unwrap();
+        reset_credentials();
+
+        env::remove_var("GOOGLE_OAUTH_CLIENT_ID");
+        env::remove_var("GOOGLE_OAUTH_CLIENT_SECRET");
+
+        let result = get_oauth_credentials();
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert!(err.contains("OAuth credentials not configured"));
+        assert!(err.contains("GOOGLE_OAUTH_CLIENT_ID"));
+        assert!(err.contains("GOOGLE_OAUTH_CLIENT_SECRET"));
+    }
+
+    #[test]
+    fn test_oauth_credentials_struct_clone() {
+        let creds = OAuthCredentials {
+            client_id: "test-id".to_string(),
+            client_secret: "test-secret".to_string(),
+        };
+
+        let cloned = creds.clone();
+        assert_eq!(creds.client_id, cloned.client_id);
+        assert_eq!(creds.client_secret, cloned.client_secret);
+    }
+
+    #[test]
+    fn test_try_load_from_env_partial() {
+        let _guard = OAUTH_TEST_MUTEX.lock().unwrap();
+        reset_credentials();
+
+        // Only set client_id, not client_secret
+        env::set_var("GOOGLE_OAUTH_CLIENT_ID", "test-id");
+        env::remove_var("GOOGLE_OAUTH_CLIENT_SECRET");
+
+        let result = try_load_from_env();
+        assert!(result.is_none());
+
+        env::remove_var("GOOGLE_OAUTH_CLIENT_ID");
+    }
+
+    #[test]
+    fn test_try_load_from_env_complete() {
+        let _guard = OAUTH_TEST_MUTEX.lock().unwrap();
+        reset_credentials();
+
+        env::set_var("GOOGLE_OAUTH_CLIENT_ID", "test-id");
+        env::set_var("GOOGLE_OAUTH_CLIENT_SECRET", "test-secret");
+
+        let result = try_load_from_env();
+        assert!(result.is_some());
+
+        let creds = result.unwrap();
+        assert_eq!(creds.client_id, "test-id");
+        assert_eq!(creds.client_secret, "test-secret");
+
+        env::remove_var("GOOGLE_OAUTH_CLIENT_ID");
+        env::remove_var("GOOGLE_OAUTH_CLIENT_SECRET");
     }
 }

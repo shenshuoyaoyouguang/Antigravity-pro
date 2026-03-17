@@ -2362,7 +2362,11 @@ impl TokenManager {
     }
 
     /// 获取 OAuth URL (支持自定义 Redirect URI)
-    pub fn get_oauth_url_with_redirect(&self, redirect_uri: &str, state: &str) -> String {
+    pub fn get_oauth_url_with_redirect(
+        &self,
+        redirect_uri: &str,
+        state: &str,
+    ) -> Result<String, String> {
         crate::modules::oauth::get_auth_url(redirect_uri, state)
     }
 
@@ -2645,6 +2649,62 @@ fn truncate_reason(reason: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use std::cmp::Ordering;
+    use std::env;
+    use crate::modules::oauth::{OAUTH_TEST_MUTEX, reset_oauth_credentials_for_tests};
+
+    fn reset_oauth_credentials() {
+        reset_oauth_credentials_for_tests();
+    }
+
+    #[test]
+    fn test_get_oauth_url_with_redirect_success() {
+        let _guard = OAUTH_TEST_MUTEX.lock().unwrap();
+        reset_oauth_credentials();
+
+        env::set_var("GOOGLE_OAUTH_CLIENT_ID", "test-client-id");
+        env::set_var("GOOGLE_OAUTH_CLIENT_SECRET", "test-client-secret");
+
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-token-manager-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_root).unwrap();
+
+        let manager = TokenManager::new(tmp_root.clone());
+        let result = manager.get_oauth_url_with_redirect("http://localhost:8080/callback", "test-state-123");
+
+        let url = result.unwrap();
+        assert!(url.contains("state=test-state-123"));
+        assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcallback"));
+
+        env::remove_var("GOOGLE_OAUTH_CLIENT_ID");
+        env::remove_var("GOOGLE_OAUTH_CLIENT_SECRET");
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn test_get_oauth_url_with_redirect_missing_credentials() {
+        let _guard = OAUTH_TEST_MUTEX.lock().unwrap();
+        reset_oauth_credentials();
+
+        env::remove_var("GOOGLE_OAUTH_CLIENT_ID");
+        env::remove_var("GOOGLE_OAUTH_CLIENT_SECRET");
+
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-token-manager-test-missing-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_root).unwrap();
+
+        let manager = TokenManager::new(tmp_root.clone());
+        let result = manager.get_oauth_url_with_redirect("http://localhost:8080/callback", "test-state");
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("OAuth credentials not configured") || err.contains("client_id"));
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
 
     #[tokio::test]
     async fn test_reload_account_purges_cache_when_account_becomes_proxy_disabled() {
